@@ -7,13 +7,20 @@ import (
 	"sync"
 	"time"
 
+	"github.com/GoogleContainerTools/kpt/tools/github-actions/api/v1alpha1"
 	"github.com/GoogleContainerTools/kpt/tools/github-actions/pkg/events"
 	github "github.com/google/go-github/v53/github"
 	"golang.org/x/oauth2"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 type Installation struct {
+	k8s client.Client
+
 	installationID int64
 	githubClient   *github.Client
 	org            string
@@ -24,21 +31,46 @@ type Installation struct {
 	lastUpdate      map[string]time.Time
 }
 
-func NewInstallation(ctx context.Context, appGithubClient *github.Client, installationID int64, org string) (*Installation, error) {
-	i := &Installation{
-		installationID: installationID,
-		org:            org,
+func newInstallationTokenSource(appGithubClient *github.Client, installationID int64) (oauth2.TokenSource, error) {
+	ts := &installationTokenSource{
+		appGithubClient: appGithubClient,
+		installationID:  installationID,
 	}
+	tok, err := ts.Token()
+	if err != nil {
+		return nil, err
+	}
+	rts := oauth2.ReuseTokenSource(tok, ts)
+	return rts, nil
+}
 
-	token, _, err := appGithubClient.Apps.CreateInstallationToken(ctx, installationID, &github.InstallationTokenOptions{})
+type installationTokenSource struct {
+	appGithubClient *github.Client
+	installationID  int64
+}
+
+func (ts *installationTokenSource) Token() (*oauth2.Token, error) {
+	ctx := context.Background()
+
+	token, _, err := ts.appGithubClient.Apps.CreateInstallationToken(ctx, ts.installationID, &github.InstallationTokenOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("creating github app installation token: %w", err)
 	}
 
-	klog.Infof("token is %+v", token)
-	// klog.Infof("response is %+v", response)
+	return &oauth2.Token{AccessToken: token.GetToken(), TokenType: "Bearer", Expiry: token.GetExpiresAt().Time}, nil
+}
 
-	githubTokenSource := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token.GetToken()})
+func NewInstallation(ctx context.Context, k8s client.Client, appGithubClient *github.Client, installationID int64, org string) (*Installation, error) {
+	i := &Installation{
+		k8s:            k8s,
+		installationID: installationID,
+		org:            org,
+	}
+
+	githubTokenSource, err := newInstallationTokenSource(appGithubClient, installationID)
+	if err != nil {
+		return nil, err
+	}
 
 	ghClient := github.NewClient(oauth2.NewClient(ctx, githubTokenSource))
 	i.githubClient = ghClient
@@ -50,6 +82,10 @@ func NewInstallation(ctx context.Context, appGithubClient *github.Client, instal
 
 func (i *Installation) AddEventHandler(handler events.Handler) {
 	i.eventHandlers = append(i.eventHandlers, handler)
+}
+
+func (i *Installation) GithubClient() *github.Client {
+	return i.githubClient
 }
 
 // PollEventsOnce queries for events once
@@ -183,10 +219,11 @@ func (i *Installation) PollRepoEventsOnce(ctx context.Context, owner string, rep
 func (i *Installation) PollForUpdates(ctx context.Context, owner string, repo string) error {
 	klog.Infof("polling for updates on %s/%s", owner, repo)
 	opt := &github.IssueListByRepoOptions{
-		State:     "open",
+		State:     "all", // we want to update state after prs/issues are closed
 		Sort:      "updated",
 		Direction: "desc",
 	}
+	// TODO: Use Since?
 	opt.PerPage = 100
 	issues, _, err := i.githubClient.Issues.ListByRepo(ctx, owner, repo, opt)
 	if err != nil {
@@ -258,6 +295,100 @@ func (i *Installation) PollForUpdates(ctx context.Context, owner string, repo st
 			}
 		}
 
+		id := types.NamespacedName{Namespace: repo, Name: fmt.Sprintf("github-%d", pullRequest.GetNumber())}
+		u := &unstructured.Unstructured{}
+		u.SetName(id.Name)
+		u.SetNamespace(id.Namespace)
+		u.SetGroupVersionKind(v1alpha1.PullRequestGVK)
+		spec := map[string]any{}
+		spec["title"] = pullRequest.GetTitle()
+		spec["url"] = pullRequest.GetHTMLURL()
+		spec["state"] = pullRequest.GetState()
+		spec["author"] = pullRequest.GetUser().GetLogin()
+		spec["body"] = pullRequest.GetBody()
+		spec["createdAt"] = asTime(pullRequest.GetCreatedAt())
+		spec["updatedAt"] = asTime(pullRequest.GetUpdatedAt())
+
+		specLabels := []v1alpha1.Label{} // empty array to keep CRDs happy
+		for _, label := range labels {
+			out := v1alpha1.Label{
+				Name: label.GetName(),
+				// CreatedAt: asTime(label.GetCreatedAt()),
+			}
+			specLabels = append(specLabels, out)
+		}
+		spec["labels"] = specLabels
+
+		specBase := v1alpha1.BaseRef{}
+		specBase.Ref = pullRequest.GetBase().GetRef()
+		specBase.SHA = pullRequest.GetBase().GetSHA()
+		for _, label := range labels {
+			out := v1alpha1.Label{
+				Name: label.GetName(),
+				// CreatedAt: asTime(label.GetCreatedAt()),
+			}
+			specLabels = append(specLabels, out)
+		}
+		spec["base"] = specBase
+
+		specComments := []v1alpha1.Comment{} // empty array to keep CRDs happy
+		for _, comment := range comments {
+			out := v1alpha1.Comment{
+				Body:      comment.GetBody(),
+				Author:    comment.GetUser().GetLogin(),
+				CreatedAt: asTime(comment.GetCreatedAt()),
+			}
+			specComments = append(specComments, out)
+		}
+		spec["comments"] = specComments
+
+		ref := pullRequest.GetHead().GetSHA()
+		// if pullRequest.GetNumber() == 4106 {
+		// 	checkSuiteList, _, err := i.githubClient.Checks.ListCheckSuitesForRef(ctx, owner, repo, ref, &github.ListCheckSuiteOptions{})
+		// 	if err != nil {
+		// 		return fmt.Errorf("listing comments for pr %s/%s %v: %w", owner, repo, pullRequest.GetNumber(), err)
+		// 	}
+		// 	klog.Infof("list check suites %q: %+v", ref, checkSuiteList.CheckSuites)
+		// 	klog.Fatalf("foo")
+		// }
+
+		checks, _, err := i.githubClient.Checks.ListCheckRunsForRef(ctx, owner, repo, ref, &github.ListCheckRunsOptions{})
+		if err != nil {
+			return fmt.Errorf("getting checks %s/%s %v: %w", owner, repo, issue.GetNumber(), err)
+		}
+		// klog.Infof("list checks: %+v", checks.CheckRuns)
+
+		checkSuites := []*v1alpha1.CheckSuite{} // empty array to keep CRDs happy
+		checkSuiteMap := make(map[int64]*v1alpha1.CheckSuite)
+
+		for _, checkRun := range checks.CheckRuns {
+			checkSuiteID := checkRun.GetCheckSuite().GetID()
+			checkSuite := checkSuiteMap[checkSuiteID]
+			if checkSuite == nil {
+				checkSuite = &v1alpha1.CheckSuite{
+					ID: checkSuiteID,
+				}
+				checkSuiteMap[checkSuiteID] = checkSuite
+				checkSuites = append(checkSuites, checkSuite)
+			}
+			out := v1alpha1.Check{
+				Name:        checkRun.GetName(),
+				Status:      checkRun.GetStatus(),
+				Conclusion:  checkRun.GetConclusion(),
+				CompletedAt: asOptionalTime(checkRun.CompletedAt),
+				ID:          checkRun.GetID(),
+			}
+			checkSuite.Checks = append(checkSuite.Checks, out)
+		}
+		spec["checkSuites"] = checkSuites
+
+		u.Object["spec"] = spec
+
+		if err := i.k8s.Patch(ctx, u, client.Apply, &client.PatchOptions{
+			FieldManager: "github-syncer",
+		}); err != nil {
+			return fmt.Errorf("updating PullRequest: %w", err)
+		}
 		i.recordSeen(ctx, issue.GetNodeID(), issue.GetUpdatedAt().Time)
 	}
 
@@ -329,3 +460,16 @@ Maybe a fast query could be:
   }
 }
 */
+
+func asOptionalTime(t *github.Timestamp) *metav1.Time {
+	if t == nil {
+		return nil
+	}
+	mt := asTime(*t)
+	return &mt
+}
+
+func asTime(t github.Timestamp) metav1.Time {
+	mt := metav1.NewTime(t.Time)
+	return mt
+}
