@@ -84,7 +84,7 @@ func (o *PullRequest) RemoveLabels(ctx context.Context, labels []string) error {
 
 func (o *PullRequest) Merge(ctx context.Context, mergeMethod string) error {
 	if o.obj.GetMerged() {
-		klog.Warningf("pr already merged")
+		klog.Warningf("pr already merged; cannot merge")
 		return nil
 	}
 
@@ -93,6 +93,52 @@ func (o *PullRequest) Merge(ctx context.Context, mergeMethod string) error {
 	options := &github.PullRequestOptions{MergeMethod: mergeMethod}
 	if _, _, err := o.githubClient.PullRequests.Merge(ctx, o.repo.owner, o.repo.repoName, o.prNumber, "", options); err != nil {
 		return fmt.Errorf("merging pull request: %w", err)
+	}
+
+	return nil
+}
+
+func (o *PullRequest) Close(ctx context.Context) error {
+	if o.obj.GetMerged() {
+		klog.Warningf("pr already merged; cannot close")
+		return nil
+	}
+
+	klog.Infof("merging pr: %v", o.prNumber)
+
+	options := &github.IssueRequest{State: PtrTo("closed")}
+	if _, _, err := o.githubClient.Issues.Edit(ctx, o.repo.owner, o.repo.repoName, o.prNumber, options); err != nil {
+		return fmt.Errorf("closing issue: %w", err)
+	}
+	return nil
+}
+
+func PtrTo[T any](t T) *T {
+	return &t
+}
+
+func (o *PullRequest) Retest(ctx context.Context, checkSuiteID int64) error {
+	workflowRuns, _, err := o.githubClient.Actions.ListRepositoryWorkflowRuns(ctx, o.repo.owner, o.repo.repoName, &github.ListWorkflowRunsOptions{
+		CheckSuiteID: checkSuiteID,
+	})
+	// result, err := appInstall.GithubClient().Checks.ReRequestCheckRun(ctx, owner, repo, checkRunID)
+	if err != nil {
+		return fmt.Errorf("listing working runs: %w", err)
+	}
+	for _, run := range workflowRuns.WorkflowRuns {
+		klog.Infof("workflow runs %+v", run)
+	}
+
+	if len(workflowRuns.WorkflowRuns) != 1 {
+		klog.Fatalf("unexpected number of workflow runs: %v", len(workflowRuns.WorkflowRuns))
+	}
+	workflowRun := workflowRuns.WorkflowRuns[0]
+	result, err := o.githubClient.Actions.RerunFailedJobsByID(ctx, o.repo.owner, o.repo.repoName, workflowRun.GetID())
+	// result, err := appInstall.GithubClient().Checks.ReRequestCheckRun(ctx, owner, repo, checkRunID)
+	if err != nil {
+		return fmt.Errorf("requesting check run: %w", err)
+	} else {
+		klog.Infof("re-requested check run %+v", result)
 	}
 
 	return nil

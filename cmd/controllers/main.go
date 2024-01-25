@@ -15,7 +15,6 @@ import (
 	"github.com/GoogleContainerTools/kpt/tools/github-actions/pkg/jwt"
 	github "github.com/google/go-github/v53/github"
 	"golang.org/x/oauth2"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -133,27 +132,54 @@ func run(ctx context.Context) error {
 				return fmt.Errorf("listing pull requests: %w", err)
 			}
 
-			if err := runHoldRobot(ctx, repo, prList.Items); err != nil {
-				return err
-			}
+			for i := range prList.Items {
+				obj := &prList.Items[i]
+				op := &op{
+					Repo:        repo,
+					PullRequest: obj,
+				}
 
-			if err := runLGTMRobot(ctx, repo, prList.Items); err != nil {
-				return err
-			}
-			if err := runApprovedRobot(ctx, repo, prList.Items); err != nil {
-				return err
-			}
+				if err := runHoldRobot(ctx, op, obj); err != nil {
+					return err
+				}
+				if op.Changed {
+					continue
+				}
 
-			if err := runMergeRobot(ctx, repo, prList.Items); err != nil {
-				return err
-			}
+				if err := runLGTMRobot(ctx, op, obj); err != nil {
+					return err
+				}
+				if op.Changed {
+					continue
+				}
 
-			if err := runCloseRobot(ctx, appInstall.GithubClient(), prList.Items); err != nil {
-				return err
-			}
+				if err := runApprovedRobot(ctx, op, obj); err != nil {
+					return err
+				}
+				if op.Changed {
+					continue
+				}
 
-			if err := runRetestRobot(ctx, appInstall.GithubClient(), prList.Items); err != nil {
-				return err
+				if err := runCloseRobot(ctx, op, obj); err != nil {
+					return err
+				}
+				if op.Changed {
+					continue
+				}
+
+				if err := runRetestRobot(ctx, op, obj); err != nil {
+					return err
+				}
+				if op.Changed {
+					continue
+				}
+
+				if err := runMergeRobot(ctx, op, obj); err != nil {
+					return err
+				}
+				if op.Changed {
+					continue
+				}
 			}
 		}
 		klog.Infof("completed poll; will poll again in a minute")
@@ -163,41 +189,30 @@ func run(ctx context.Context) error {
 	return nil
 }
 
-func runCloseRobot(ctx context.Context, githubClient *github.Client, pullRequests []v1alpha1.PullRequest) error {
-	owner := "kptdev"
-	repo := "kpt"
-
-	for _, pr := range pullRequests {
-		var closeAt metav1.Time
-		for _, comment := range pr.Spec.Comments {
-			for _, line := range strings.Split(comment.Body, "\n") {
-				line = strings.TrimSpace(line)
-				line += " "
-				if strings.HasPrefix(line, "/close ") {
-					closeAt = comment.CreatedAt
-				}
-			}
-		}
-
-		if closeAt.IsZero() {
-			continue
-		}
-
-		if pr.Spec.State == "closed" {
-			continue
-		}
-
-		// TODO: What about reopen etc?  Maybe check timeline or closedAt?
-
-		klog.Infof("closing issue %v", pr.Name)
-		prNumber, err := strconv.Atoi(strings.TrimPrefix(pr.Name, "github-"))
-		if err != nil {
-			return fmt.Errorf("parsing name %q", pr.Name)
-		}
-		if _, _, err := githubClient.Issues.Edit(ctx, owner, repo, prNumber, &github.IssueRequest{State: PtrTo("closed")}); err != nil {
-			return fmt.Errorf("updating issue: %w", err)
-		}
+func runCloseRobot(ctx context.Context, op *op, pullRequest *v1alpha1.PullRequest) error {
+	if !isOpen(pullRequest) {
+		return nil
 	}
+
+	r := ThreadReader{
+		ApplyCommands: []string{"/close"},
+	}
+
+	applyAt, cancelAt, err := r.ParseForCommands(ctx, op.Repo, pullRequest)
+	if err != nil {
+		return err
+	}
+	if applyAt == nil && cancelAt == nil {
+		return err
+	}
+
+	// TODO: What about reopen etc?  Maybe check timeline or closedAt?
+
+	klog.Infof("closing issue %v", pullRequest.Name)
+	if err := op.ClosePullRequest(ctx); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -205,81 +220,36 @@ func PtrTo[T any](t T) *T {
 	return &t
 }
 
-func runRetestRobot(ctx context.Context, githubClient *github.Client, pullRequests []v1alpha1.PullRequest) error {
-	owner := "kptdev"
-	repo := "kpt"
+func runRetestRobot(ctx context.Context, op *op, pullRequest *v1alpha1.PullRequest) error {
+	if !isOpen(pullRequest) {
+		return nil
+	}
 
-	for _, pr := range pullRequests {
-		var retestAt metav1.Time
-		for _, comment := range pr.Spec.Comments {
-			for _, line := range strings.Split(comment.Body, "\n") {
-				line += " "
-				if strings.HasPrefix(line, "/retest ") {
-					retestAt = comment.CreatedAt
-				}
-			}
-		}
+	r := ThreadReader{
+		ApplyCommands: []string{"/retest"},
+	}
 
-		if retestAt.IsZero() {
-			continue
-		}
+	applyAt, cancelAt, err := r.ParseForCommands(ctx, op.Repo, pullRequest)
+	if err != nil {
+		return err
+	}
+	if applyAt == nil && cancelAt == nil {
+		return err
+	}
 
-		for _, checkSuite := range pr.Spec.CheckSuites {
-			retest := false
+	if applyAt != nil {
+		for _, checkSuite := range pullRequest.Spec.CheckSuites {
 			for _, checkRun := range checkSuite.Checks {
 				if checkRun.Status != "completed" || checkRun.Conclusion != "failure" {
 					continue
 				}
-				if checkRun.CompletedAt != nil && retestAt.After(checkRun.CompletedAt.Time) {
-					klog.Infof("retest requested for pr %v on check %q", pr.GetName(), checkRun.Name)
-					retest = true
+				if checkRun.CompletedAt != nil && applyAt.CreatedAt.After(checkRun.CompletedAt.Time) {
+					klog.Infof("retest requested for pr %v on check %q", pullRequest.GetName(), checkRun.Name)
 
-					// checkRunID := checkRun.ID
-
-					workflowRuns, _, err := githubClient.Actions.ListRepositoryWorkflowRuns(ctx, owner, repo, &github.ListWorkflowRunsOptions{
-						CheckSuiteID: checkSuite.ID,
-					})
-					// result, err := appInstall.GithubClient().Checks.ReRequestCheckRun(ctx, owner, repo, checkRunID)
-					if err != nil {
-						return fmt.Errorf("listing working runs: %w", err)
-					}
-					for _, run := range workflowRuns.WorkflowRuns {
-						klog.Infof("workflow runs %+v", run)
-					}
-
-					if len(workflowRuns.WorkflowRuns) != 1 {
-						klog.Fatalf("unexpected number of workflow runs: %v", len(workflowRuns.WorkflowRuns))
-					}
-					workflowRun := workflowRuns.WorkflowRuns[0]
-					result, err := githubClient.Actions.RerunFailedJobsByID(ctx, owner, repo, workflowRun.GetID())
-					// result, err := appInstall.GithubClient().Checks.ReRequestCheckRun(ctx, owner, repo, checkRunID)
-					if err != nil {
-						klog.Warningf("requesting check re-run: %v", err)
-						// return fmt.Errorf("requesting check run: %w", err)
-					} else {
-						klog.Infof("re-requested check run %+v", result)
+					if err := op.Retest(ctx, checkRun.ID); err != nil {
+						return err
 					}
 				}
-			}
-
-			if retest {
-
-				// checkSuiteID := checkSuite.ID
-
-				// result, err := appInstall.GithubClient().Checks.ReRequestCheckSuite(ctx, owner, repo, checkSuiteID)
-				// if err != nil {
-				// 	// klog.Warningf("requesting check suite re-run: %v", err)
-				// 	return fmt.Errorf("requesting check suite re-run: %w", err)
-				// }
-				// klog.Infof("re-requested check run %+v", result)
-
-				// result, err := appInstall.GithubClient().Actions.RerunFailedJobsByID(ctx, ReRequestCheckSuite(ctx, owner, repo, checkRunID)
-				// if err != nil {
-				// 	// klog.Warningf("requesting check suite re-run: %v", err)
-				// 	return fmt.Errorf("requesting check suite re-run: %w", err)
-				// }
-				// klog.Infof("re-requested check run %+v", result)
-
 			}
 		}
 	}
@@ -287,36 +257,38 @@ func runRetestRobot(ctx context.Context, githubClient *github.Client, pullReques
 	return nil
 }
 
-func runHoldRobot(ctx context.Context, repo *forge.Repo, pullRequests []v1alpha1.PullRequest) error {
-	for i := range pullRequests {
-		obj := &pullRequests[i]
+type op struct {
+	Repo        *forge.Repo
+	PullRequest *v1alpha1.PullRequest
+	Changed     bool
+}
 
-		if !isOpen(obj) {
-			// May not matter
-			continue
-		}
+func runHoldRobot(ctx context.Context, op *op, obj *v1alpha1.PullRequest) error {
+	if !isOpen(obj) {
+		// It may be OK to apply labels to old PRs... IDK
+		return nil
+	}
 
-		r := ThreadReader{
-			ApplyCommands:  []string{"/hold"},
-			CancelCommands: []string{"/hold cancel", "/unhold", "/remove-hold"},
-		}
+	r := ThreadReader{
+		ApplyCommands:  []string{"/hold"},
+		CancelCommands: []string{"/hold cancel", "/unhold", "/remove-hold"},
+	}
 
-		applyAt, cancelAt, err := r.ParseForCommands(ctx, repo, obj)
-		if err != nil {
-			return err
-		}
-		if applyAt == nil && cancelAt == nil {
-			continue
-		}
+	applyAt, cancelAt, err := r.ParseForCommands(ctx, op.Repo, obj)
+	if err != nil {
+		return err
+	}
+	if applyAt == nil && cancelAt == nil {
+		return err
+	}
 
-		if applyAt != nil {
-			if err := addLabels(ctx, repo, obj, []string{LabelHold}); err != nil {
-				return fmt.Errorf("adding hold label: %w", err)
-			}
-		} else if cancelAt != nil {
-			if err := removeLabels(ctx, repo, obj, []string{LabelHold}); err != nil {
-				return fmt.Errorf("adding hold label: %w", err)
-			}
+	if applyAt != nil {
+		if err := op.AddLabels(ctx, []string{LabelHold}); err != nil {
+			return fmt.Errorf("adding hold label: %w", err)
+		}
+	} else if cancelAt != nil {
+		if err := op.RemoveLabels(ctx, []string{LabelHold}); err != nil {
+			return fmt.Errorf("adding hold label: %w", err)
 		}
 	}
 
@@ -351,41 +323,34 @@ func isApprover(ctx context.Context, repo *forge.Repo, baseRef string, userName 
 // 	return false, nil
 // }
 
-func runLGTMRobot(ctx context.Context, repo *forge.Repo, pullRequests []v1alpha1.PullRequest) error {
-	for i := range pullRequests {
-		obj := &pullRequests[i]
+func runLGTMRobot(ctx context.Context, op *op, obj *v1alpha1.PullRequest) error {
 
-		if !isOpen(obj) {
-			continue
-		}
+	if !isOpen(obj) {
+		return nil
+	}
 
-		r := ThreadReader{
-			ApplyCommands:  []string{"/lgtm"},
-			CancelCommands: []string{"/lgtm cancel"},
-		}
-		r.AddPermissionCheck(requireCodeOwnerPermission(repo, obj, "approve"))
-		r.AddPermissionCheck(noSelfApproval(repo, obj, "approve"))
+	r := ThreadReader{
+		ApplyCommands:  []string{"/lgtm"},
+		CancelCommands: []string{"/lgtm cancel"},
+	}
+	r.AddPermissionCheck(op.requireCodeOwnerPermission("lgtm"))
+	r.AddPermissionCheck(op.noSelfApproval("lgtm"))
 
-		applyAt, cancelAt, err := r.ParseForCommands(ctx, repo, obj)
-		if err != nil {
-			return err
-		}
-		if applyAt == nil && cancelAt == nil {
-			continue
-		}
+	applyAt, cancelAt, err := r.ParseForCommands(ctx, op.Repo, obj)
+	if err != nil {
+		return err
+	}
+	if applyAt == nil && cancelAt == nil {
+		return nil
+	}
 
-		if applyAt != nil {
-			if !hasLabel(obj, LabelLGTM) {
-				if err := addLabels(ctx, repo, obj, []string{LabelLGTM}); err != nil {
-					return fmt.Errorf("updating lgtm: %w", err)
-				}
-			}
-		} else if cancelAt == nil {
-			if hasLabel(obj, LabelLGTM) {
-				if err := removeLabels(ctx, repo, obj, []string{LabelLGTM}); err != nil {
-					return fmt.Errorf("updating lgtm: %w", err)
-				}
-			}
+	if applyAt != nil {
+		if err := op.AddLabels(ctx, []string{LabelLGTM}); err != nil {
+			return fmt.Errorf("updating lgtm: %w", err)
+		}
+	} else if cancelAt == nil {
+		if err := op.RemoveLabels(ctx, []string{LabelLGTM}); err != nil {
+			return fmt.Errorf("updating lgtm: %w", err)
 		}
 	}
 
@@ -457,14 +422,14 @@ func (r *ThreadReader) ParseForCommands(ctx context.Context, repo *forge.Repo, o
 	return applyAt, cancelAt, nil
 }
 
-func requireCodeOwnerPermission(repo *forge.Repo, obj *v1alpha1.PullRequest, verb string) PermissionCheckFunction {
+func (op *op) requireCodeOwnerPermission(verb string) PermissionCheckFunction {
 	return func(ctx context.Context, comment *v1alpha1.Comment) (bool, error) {
-		if obj.Spec.Base == nil {
+		if op.PullRequest.Spec.Base == nil {
 			return false, fmt.Errorf("base not populated")
 		}
-		baseRef := obj.Spec.Base.SHA
+		baseRef := op.PullRequest.Spec.Base.SHA
 
-		isApprover, err := isApprover(ctx, repo, baseRef, comment.Author)
+		isApprover, err := isApprover(ctx, op.Repo, baseRef, comment.Author)
 		if err != nil {
 			return false, err
 		}
@@ -478,10 +443,9 @@ func requireCodeOwnerPermission(repo *forge.Repo, obj *v1alpha1.PullRequest, ver
 	}
 }
 
-func noSelfApproval(repo *forge.Repo, obj *v1alpha1.PullRequest, verb string) PermissionCheckFunction {
+func (op *op) noSelfApproval(verb string) PermissionCheckFunction {
 	return func(ctx context.Context, comment *v1alpha1.Comment) (bool, error) {
-
-		if comment.Author == obj.Spec.Author {
+		if comment.Author == op.PullRequest.Spec.Author {
 			// TODO: post message?
 			klog.Warningf("user %q cannot %q their own PR", verb, comment.Author)
 			return false, nil
@@ -491,48 +455,84 @@ func noSelfApproval(repo *forge.Repo, obj *v1alpha1.PullRequest, verb string) Pe
 	}
 }
 
-func runApprovedRobot(ctx context.Context, repo *forge.Repo, pullRequests []v1alpha1.PullRequest) error {
-	for i := range pullRequests {
-		obj := &pullRequests[i]
+func runApprovedRobot(ctx context.Context, op *op, obj *v1alpha1.PullRequest) error {
 
-		if !isOpen(obj) {
-			continue
+	if !isOpen(obj) {
+		return nil
+	}
+
+	r := ThreadReader{
+		ApplyCommands:  []string{"/approve"},
+		CancelCommands: []string{"/remove-approve"},
+	}
+	r.AddPermissionCheck(op.requireCodeOwnerPermission("approve"))
+	r.AddPermissionCheck(op.noSelfApproval("approve"))
+
+	applyAt, cancelAt, err := r.ParseForCommands(ctx, op.Repo, obj)
+	if err != nil {
+		return err
+	}
+	if applyAt == nil && cancelAt == nil {
+		return nil
+	}
+
+	if applyAt != nil {
+		if err := op.AddLabels(ctx, []string{LabelApproved}); err != nil {
+			return fmt.Errorf("updating approved: %w", err)
 		}
-
-		r := ThreadReader{
-			ApplyCommands:  []string{"/approve"},
-			CancelCommands: []string{"/remove-approve"},
-		}
-		r.AddPermissionCheck(requireCodeOwnerPermission(repo, obj, "approve"))
-		r.AddPermissionCheck(noSelfApproval(repo, obj, "approve"))
-
-		applyAt, cancelAt, err := r.ParseForCommands(ctx, repo, obj)
-		if err != nil {
-			return err
-		}
-		if applyAt == nil && cancelAt == nil {
-			continue
-		}
-
-		if applyAt != nil {
-			if err := addLabels(ctx, repo, obj, []string{LabelApproved}); err != nil {
-				return fmt.Errorf("updating approved: %w", err)
-			}
-		} else if cancelAt == nil {
-
-			if err := removeLabels(ctx, repo, obj, []string{LabelApproved}); err != nil {
-				return fmt.Errorf("updating approved: %w", err)
-			}
+	} else if cancelAt == nil {
+		if err := op.RemoveLabels(ctx, []string{LabelApproved}); err != nil {
+			return fmt.Errorf("updating approved: %w", err)
 		}
 	}
 
 	return nil
 }
 
-func addLabels(ctx context.Context, repo *forge.Repo, obj *v1alpha1.PullRequest, labels []string) error {
+func (op *op) Retest(ctx context.Context, checkSuiteID int64) error {
+	prNumber, err := strconv.Atoi(strings.TrimPrefix(op.PullRequest.Name, "github-"))
+	if err != nil {
+		return fmt.Errorf("parsing name %q", op.PullRequest.Name)
+	}
+
+	pr, err := op.Repo.PullRequest(ctx, prNumber)
+	if err != nil {
+		return fmt.Errorf("getting pull request: %w", err)
+	}
+
+	if err := pr.Retest(ctx, checkSuiteID); err != nil {
+		return fmt.Errorf("triggering retest: %w", err)
+	}
+	op.Changed = true
+	return nil
+}
+
+func (op *op) ClosePullRequest(ctx context.Context) error {
+	if !isOpen(op.PullRequest) {
+		return nil
+	}
+
+	prNumber, err := strconv.Atoi(strings.TrimPrefix(op.PullRequest.Name, "github-"))
+	if err != nil {
+		return fmt.Errorf("parsing name %q", op.PullRequest.Name)
+	}
+
+	pr, err := op.Repo.PullRequest(ctx, prNumber)
+	if err != nil {
+		return fmt.Errorf("getting pull request: %w", err)
+	}
+
+	if err := pr.Close(ctx); err != nil {
+		return fmt.Errorf("closing pull request: %w", err)
+	}
+	op.Changed = true
+	return nil
+}
+
+func (op *op) AddLabels(ctx context.Context, labels []string) error {
 	hasAllLabels := true
 	for _, label := range labels {
-		if !hasLabel(obj, label) {
+		if !hasLabel(op.PullRequest, label) {
 			hasAllLabels = false
 		}
 	}
@@ -540,12 +540,12 @@ func addLabels(ctx context.Context, repo *forge.Repo, obj *v1alpha1.PullRequest,
 		return nil
 	}
 
-	prNumber, err := strconv.Atoi(strings.TrimPrefix(obj.Name, "github-"))
+	prNumber, err := strconv.Atoi(strings.TrimPrefix(op.PullRequest.Name, "github-"))
 	if err != nil {
-		return fmt.Errorf("parsing name %q", obj.Name)
+		return fmt.Errorf("parsing name %q", op.PullRequest.Name)
 	}
 
-	pr, err := repo.PullRequest(ctx, prNumber)
+	pr, err := op.Repo.PullRequest(ctx, prNumber)
 	if err != nil {
 		return fmt.Errorf("getting pull request: %w", err)
 	}
@@ -553,25 +553,26 @@ func addLabels(ctx context.Context, repo *forge.Repo, obj *v1alpha1.PullRequest,
 	if err := pr.AddLabels(ctx, labels); err != nil {
 		return fmt.Errorf("updating labels: %w", err)
 	}
+	op.Changed = true
 	return nil
 }
 
-func removeLabels(ctx context.Context, repo *forge.Repo, obj *v1alpha1.PullRequest, labels []string) error {
+func (op *op) RemoveLabels(ctx context.Context, labels []string) error {
 	hasAnyLabel := false
 	for _, label := range labels {
-		if hasLabel(obj, label) {
+		if hasLabel(op.PullRequest, label) {
 			hasAnyLabel = true
 		}
 	}
 	if !hasAnyLabel {
 		return nil
 	}
-	prNumber, err := strconv.Atoi(strings.TrimPrefix(obj.Name, "github-"))
+	prNumber, err := strconv.Atoi(strings.TrimPrefix(op.PullRequest.Name, "github-"))
 	if err != nil {
-		return fmt.Errorf("parsing name %q", obj.Name)
+		return fmt.Errorf("parsing name %q", op.PullRequest.Name)
 	}
 
-	pr, err := repo.PullRequest(ctx, prNumber)
+	pr, err := op.Repo.PullRequest(ctx, prNumber)
 	if err != nil {
 		return fmt.Errorf("getting pull request: %w", err)
 	}
@@ -579,60 +580,58 @@ func removeLabels(ctx context.Context, repo *forge.Repo, obj *v1alpha1.PullReque
 	if err := pr.RemoveLabels(ctx, labels); err != nil {
 		return fmt.Errorf("updating labels: %w", err)
 	}
+	op.Changed = true
 	return nil
 }
 
-func runMergeRobot(ctx context.Context, repo *forge.Repo, pullRequests []v1alpha1.PullRequest) error {
-	for i := range pullRequests {
-		obj := &pullRequests[i]
+func runMergeRobot(ctx context.Context, op *op, obj *v1alpha1.PullRequest) error {
+	if !isOpen(obj) {
+		return nil
+	}
 
-		if !isOpen(obj) {
-			continue
-		}
+	prNumber, err := strconv.Atoi(strings.TrimPrefix(obj.Name, "github-"))
+	if err != nil {
+		return fmt.Errorf("parsing name %q", obj.Name)
+	}
 
-		prNumber, err := strconv.Atoi(strings.TrimPrefix(obj.Name, "github-"))
-		if err != nil {
-			return fmt.Errorf("parsing name %q", obj.Name)
-		}
+	hasLGTM := hasLabel(obj, LabelLGTM)
+	hasApproved := hasLabel(obj, LabelApproved)
+	hasHold := hasLabel(obj, LabelHold)
 
-		hasLGTM := hasLabel(obj, LabelLGTM)
-		hasApproved := hasLabel(obj, LabelApproved)
-		hasHold := hasLabel(obj, LabelHold)
+	if hasHold || !hasLGTM || !hasApproved {
+		return nil
+	}
 
-		if hasHold || !hasLGTM || !hasApproved {
-			continue
-		}
-
-		allTestsPassing := true
-		testCount := 0
-		for _, checkSuites := range obj.Spec.CheckSuites {
-			for _, check := range checkSuites.Checks {
-				testCount++
-				switch check.Conclusion {
-				case "success":
-				default:
-					allTestsPassing = false
-				}
+	allTestsPassing := true
+	testCount := 0
+	for _, checkSuites := range obj.Spec.CheckSuites {
+		for _, check := range checkSuites.Checks {
+			testCount++
+			switch check.Conclusion {
+			case "success":
+			default:
+				allTestsPassing = false
 			}
 		}
-
-		if testCount == 0 {
-			klog.Warningf("pr %v has lgtm/approved, but no check results", prNumber)
-			continue
-		}
-
-		if !allTestsPassing {
-			continue
-		}
-
-		pr, err := repo.PullRequest(ctx, prNumber)
-		if err != nil {
-			return fmt.Errorf("getting pull request: %w", err)
-		}
-		if err := pr.Merge(ctx, "merge"); err != nil {
-			return fmt.Errorf("merging pr: %w", err)
-		}
 	}
+
+	if testCount == 0 {
+		klog.Warningf("pr %v has lgtm/approved, but no check results", prNumber)
+		return nil
+	}
+
+	if !allTestsPassing {
+		return nil
+	}
+
+	pr, err := op.Repo.PullRequest(ctx, prNumber)
+	if err != nil {
+		return fmt.Errorf("getting pull request: %w", err)
+	}
+	if err := pr.Merge(ctx, "merge"); err != nil {
+		return fmt.Errorf("merging pr: %w", err)
+	}
+	op.Changed = true
 
 	return nil
 }

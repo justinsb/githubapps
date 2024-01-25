@@ -1,15 +1,13 @@
 package lgtm
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"net/http"
 	"strings"
 	"time"
 
 	"github.com/GoogleContainerTools/kpt/tools/github-actions/pkg/events"
+	"github.com/GoogleContainerTools/kpt/tools/github-actions/pkg/githubgraphql"
 	"github.com/google/go-github/v53/github"
 	"k8s.io/klog/v2"
 )
@@ -18,17 +16,12 @@ type EventHandler struct {
 }
 
 func (op *op) canLGTM(ctx context.Context, userName string) (bool, error) {
-	owners := op.owners
-	if op.owners == nil {
-		r, err := op.loadRepoOwners(ctx, op.pr.BaseRef)
-		if err != nil {
-			return false, err
-		}
-		owners = r
-		op.owners = r
+	codeOwners, err := op.scope.CodeOwners(ctx, op.pr.BaseRef)
+	if err != nil {
+		return false, err
 	}
 
-	for _, owner := range owners.Owners {
+	for _, owner := range codeOwners.Owners {
 		if owner == userName {
 			return true, nil
 		}
@@ -41,8 +34,6 @@ type op struct {
 	pr    *events.PullRequest
 
 	lgtm int
-
-	owners *Owners
 }
 
 func (op *op) processComment(ctx context.Context, comment *events.Comment) error {
@@ -234,7 +225,7 @@ func (r *EventHandler) convertPullRequestToDraft(ctx context.Context, scope *eve
 		"clientMutationId": fmt.Sprintf("%v", time.Now().UnixNano()),
 		"pullRequestId":    pr.GetNodeID(),
 	}
-	query := graphqlQuery{
+	query := githubgraphql.Query{
 		Query: `mutation ConvertPullRequestToDraft($input:ConvertPullRequestToDraftInput!) { convertPullRequestToDraft(input: $input) { clientMutationId } }`,
 		Variables: map[string]any{
 			"input": input,
@@ -258,7 +249,7 @@ func (r *EventHandler) convertPullRequestToDraft(ctx context.Context, scope *eve
 	// }
 
 	out := make(map[string]any)
-	if err := r.doGraphQL(ctx, scope, query, out); err != nil {
+	if err := query.Run(ctx, scope, out); err != nil {
 		return fmt.Errorf("calling convertPullRequestToDraft: %w", err)
 	}
 
@@ -328,85 +319,6 @@ func (r *EventHandler) removeLabels(ctx context.Context, scope *events.Scope, pr
 			return fmt.Errorf("removing label %q: %w", label, err)
 		}
 	}
-
-	return nil
-}
-
-type Owners struct {
-	Owners []string
-}
-
-func (op *op) loadRepoOwners(ctx context.Context, ref string) (*Owners, error) {
-	owners := &Owners{}
-
-	fileContent, _, _, err := op.scope.Github.Repositories.GetContents(ctx, op.scope.Owner, op.scope.Repo, "CODEOWNERS", &github.RepositoryContentGetOptions{Ref: ref})
-	if err != nil {
-		return nil, fmt.Errorf("reading CODEOWNERS file: %w", err)
-	}
-	if fileContent == nil {
-		return nil, fmt.Errorf("CODEOWNERS file content is nil: %w", err)
-	}
-	content, err := fileContent.GetContent()
-	if err != nil {
-		return nil, fmt.Errorf("reading CODEOWNERS file: %w", err)
-	}
-	for _, line := range strings.Split(content, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		owners.Owners = append(owners.Owners, line)
-	}
-	// TODO: HACK!
-	owners.Owners = append(owners.Owners, "justinsb")
-	return owners, nil
-}
-
-type graphqlQuery struct {
-	Query     string         `json:"query,omitempty"`
-	Variables map[string]any `json:"variables,omitempty"`
-}
-
-type graphqlResponse struct {
-	Errors []graphqlError `json:"errors,omitempty"`
-}
-
-type graphqlError struct {
-	Type      string                 `json:"type,omitempty"`
-	Path      []string               `json:"path,omitempty"`
-	Message   string                 `json:"message,omitempty"`
-	Locations []graphqlErrorLocation `json:"locations,omitempty"`
-}
-
-type graphqlErrorLocation struct {
-	Line   int `json:"line,omitempty"`
-	Column int `json:"column,omitempty"`
-}
-
-func (r *EventHandler) doGraphQL(ctx context.Context, scope *events.Scope, query graphqlQuery, out any) error {
-	bodyBytes, err := json.Marshal(query)
-	if err != nil {
-		return fmt.Errorf("building json for graphql query: %w", err)
-	}
-
-	klog.Infof("graphql query is %v", string(bodyBytes))
-
-	u := scope.Github.BaseURL.JoinPath("/graphql")
-	req, err := http.NewRequest("POST", u.String(), bytes.NewReader(bodyBytes))
-	if err != nil {
-		return fmt.Errorf("building request: %w", err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-
-	var outBytes bytes.Buffer
-	response, err := scope.Github.Do(ctx, req, &outBytes)
-	if err != nil {
-		return fmt.Errorf("making graphql request: %w", err)
-	}
-	klog.Infof("github /graphql response data: %+v", outBytes.String())
-	klog.Infof("github /graphql response: %+v", response)
-	klog.Infof("github /graphql response status: %+v", response.Status)
 
 	return nil
 }

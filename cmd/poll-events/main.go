@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/GoogleContainerTools/kpt/tools/github-actions/pkg/appinstall"
-	"github.com/GoogleContainerTools/kpt/tools/github-actions/pkg/events/lgtm"
+	"github.com/GoogleContainerTools/kpt/tools/github-actions/pkg/events/retest"
 	"github.com/GoogleContainerTools/kpt/tools/github-actions/pkg/jwt"
 	github "github.com/google/go-github/v53/github"
 	"golang.org/x/oauth2"
@@ -79,8 +79,11 @@ func run(ctx context.Context) error {
 			return err
 		}
 
-		lgtm := &lgtm.EventHandler{}
-		installScope.AddEventHandler(lgtm)
+		// lgtm := &lgtm.EventHandler{}
+		// installScope.AddEventHandler(lgtm)
+
+		retest := &retest.RetestHandler{}
+		installScope.AddEventHandler(retest)
 
 		appInstalls = append(appInstalls, installScope)
 	}
