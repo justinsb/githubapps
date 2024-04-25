@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -16,6 +17,7 @@ import (
 	github "github.com/google/go-github/v53/github"
 	"golang.org/x/oauth2"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
@@ -134,51 +136,14 @@ func run(ctx context.Context) error {
 
 			for i := range prList.Items {
 				obj := &prList.Items[i]
-				op := &op{
+				op := &Op{
 					Repo:        repo,
 					PullRequest: obj,
 				}
 
-				if err := runHoldRobot(ctx, op, obj); err != nil {
-					return err
-				}
-				if op.Changed {
-					continue
-				}
-
-				if err := runLGTMRobot(ctx, op, obj); err != nil {
-					return err
-				}
-				if op.Changed {
-					continue
-				}
-
-				if err := runApprovedRobot(ctx, op, obj); err != nil {
-					return err
-				}
-				if op.Changed {
-					continue
-				}
-
-				if err := runCloseRobot(ctx, op, obj); err != nil {
-					return err
-				}
-				if op.Changed {
-					continue
-				}
-
-				if err := runRetestRobot(ctx, op, obj); err != nil {
-					return err
-				}
-				if op.Changed {
-					continue
-				}
-
-				if err := runMergeRobot(ctx, op, obj); err != nil {
-					return err
-				}
-				if op.Changed {
-					continue
+				// klog.Infof("running reconcile for %v", obj.GetName())
+				if err := runAllReconcilers(ctx, k8s, op, obj); err != nil {
+					klog.Warningf("error reconciling %v: %v", obj.GetName(), err)
 				}
 			}
 		}
@@ -189,7 +154,56 @@ func run(ctx context.Context) error {
 	return nil
 }
 
-func runCloseRobot(ctx context.Context, op *op, pullRequest *v1alpha1.PullRequest) error {
+func runAllReconcilers(ctx context.Context, k8s client.Client, op *Op, obj *v1alpha1.PullRequest) error {
+	id := types.NamespacedName{Namespace: obj.GetNamespace(), Name: obj.GetName()}
+
+	var reconcilers []func(ctx context.Context, op *Op, obj *v1alpha1.PullRequest) error
+
+	reconcilers = append(reconcilers, runRetestRobot)
+	reconcilers = append(reconcilers, runHoldRobot)
+	reconcilers = append(reconcilers, runLGTMRobot)
+	reconcilers = append(reconcilers, runApprovedRobot)
+	reconcilers = append(reconcilers, runCloseRobot)
+	reconcilers = append(reconcilers, runMergeRobot)
+
+	for {
+		op.Changed = false
+
+		for _, reconciler := range reconcilers {
+			if err := reconciler(ctx, op, obj); err != nil {
+				return err
+			}
+			if op.Changed {
+				break
+			}
+		}
+
+		if !op.Changed {
+			break
+		}
+
+		prNumber, err := strconv.Atoi(strings.TrimPrefix(op.PullRequest.Name, "github-"))
+		if err != nil {
+			return fmt.Errorf("parsing name %q", op.PullRequest.Name)
+		}
+
+		if err := forge.SyncObjectFromGithub(ctx, k8s, op.Repo, prNumber); err != nil {
+			return err
+		}
+
+		updated := &v1alpha1.PullRequest{}
+		if err := k8s.Get(ctx, id, updated); err != nil {
+			return fmt.Errorf("getting updated object: %w", err)
+		}
+		j, _ := json.Marshal(updated)
+		klog.Infof("updated object is %v", string(j))
+		obj = updated
+	}
+
+	return nil
+}
+
+func runCloseRobot(ctx context.Context, op *Op, pullRequest *v1alpha1.PullRequest) error {
 	if !isOpen(pullRequest) {
 		return nil
 	}
@@ -220,7 +234,7 @@ func PtrTo[T any](t T) *T {
 	return &t
 }
 
-func runRetestRobot(ctx context.Context, op *op, pullRequest *v1alpha1.PullRequest) error {
+func runRetestRobot(ctx context.Context, op *Op, pullRequest *v1alpha1.PullRequest) error {
 	if !isOpen(pullRequest) {
 		return nil
 	}
@@ -246,7 +260,7 @@ func runRetestRobot(ctx context.Context, op *op, pullRequest *v1alpha1.PullReque
 				if checkRun.CompletedAt != nil && applyAt.CreatedAt.After(checkRun.CompletedAt.Time) {
 					klog.Infof("retest requested for pr %v on check %q", pullRequest.GetName(), checkRun.Name)
 
-					if err := op.Retest(ctx, checkRun.ID); err != nil {
+					if err := op.Retest(ctx, checkSuite.ID); err != nil {
 						return err
 					}
 				}
@@ -257,13 +271,13 @@ func runRetestRobot(ctx context.Context, op *op, pullRequest *v1alpha1.PullReque
 	return nil
 }
 
-type op struct {
+type Op struct {
 	Repo        *forge.Repo
 	PullRequest *v1alpha1.PullRequest
 	Changed     bool
 }
 
-func runHoldRobot(ctx context.Context, op *op, obj *v1alpha1.PullRequest) error {
+func runHoldRobot(ctx context.Context, op *Op, obj *v1alpha1.PullRequest) error {
 	if !isOpen(obj) {
 		// It may be OK to apply labels to old PRs... IDK
 		return nil
@@ -323,7 +337,7 @@ func isApprover(ctx context.Context, repo *forge.Repo, baseRef string, userName 
 // 	return false, nil
 // }
 
-func runLGTMRobot(ctx context.Context, op *op, obj *v1alpha1.PullRequest) error {
+func runLGTMRobot(ctx context.Context, op *Op, obj *v1alpha1.PullRequest) error {
 
 	if !isOpen(obj) {
 		return nil
@@ -422,7 +436,7 @@ func (r *ThreadReader) ParseForCommands(ctx context.Context, repo *forge.Repo, o
 	return applyAt, cancelAt, nil
 }
 
-func (op *op) requireCodeOwnerPermission(verb string) PermissionCheckFunction {
+func (op *Op) requireCodeOwnerPermission(verb string) PermissionCheckFunction {
 	return func(ctx context.Context, comment *v1alpha1.Comment) (bool, error) {
 		if op.PullRequest.Spec.Base == nil {
 			return false, fmt.Errorf("base not populated")
@@ -436,18 +450,18 @@ func (op *op) requireCodeOwnerPermission(verb string) PermissionCheckFunction {
 
 		if !isApprover {
 			// TODO: post message?
-			klog.Warningf("user %q cannot %q PRs", verb, comment.Author)
+			klog.Warningf("user %q cannot %q PRs", comment.Author, verb)
 		}
 
 		return isApprover, nil
 	}
 }
 
-func (op *op) noSelfApproval(verb string) PermissionCheckFunction {
+func (op *Op) noSelfApproval(verb string) PermissionCheckFunction {
 	return func(ctx context.Context, comment *v1alpha1.Comment) (bool, error) {
 		if comment.Author == op.PullRequest.Spec.Author {
 			// TODO: post message?
-			klog.Warningf("user %q cannot %q their own PR", verb, comment.Author)
+			klog.Warningf("user %q cannot %q their own PR", comment.Author, verb)
 			return false, nil
 		}
 
@@ -455,7 +469,7 @@ func (op *op) noSelfApproval(verb string) PermissionCheckFunction {
 	}
 }
 
-func runApprovedRobot(ctx context.Context, op *op, obj *v1alpha1.PullRequest) error {
+func runApprovedRobot(ctx context.Context, op *Op, obj *v1alpha1.PullRequest) error {
 
 	if !isOpen(obj) {
 		return nil
@@ -489,7 +503,7 @@ func runApprovedRobot(ctx context.Context, op *op, obj *v1alpha1.PullRequest) er
 	return nil
 }
 
-func (op *op) Retest(ctx context.Context, checkSuiteID int64) error {
+func (op *Op) Retest(ctx context.Context, checkSuiteID int64) error {
 	prNumber, err := strconv.Atoi(strings.TrimPrefix(op.PullRequest.Name, "github-"))
 	if err != nil {
 		return fmt.Errorf("parsing name %q", op.PullRequest.Name)
@@ -500,6 +514,7 @@ func (op *op) Retest(ctx context.Context, checkSuiteID int64) error {
 		return fmt.Errorf("getting pull request: %w", err)
 	}
 
+	klog.Infof("triggering retest for PR %v", prNumber)
 	if err := pr.Retest(ctx, checkSuiteID); err != nil {
 		return fmt.Errorf("triggering retest: %w", err)
 	}
@@ -507,7 +522,7 @@ func (op *op) Retest(ctx context.Context, checkSuiteID int64) error {
 	return nil
 }
 
-func (op *op) ClosePullRequest(ctx context.Context) error {
+func (op *Op) ClosePullRequest(ctx context.Context) error {
 	if !isOpen(op.PullRequest) {
 		return nil
 	}
@@ -522,6 +537,7 @@ func (op *op) ClosePullRequest(ctx context.Context) error {
 		return fmt.Errorf("getting pull request: %w", err)
 	}
 
+	klog.Infof("closing PR %v", prNumber)
 	if err := pr.Close(ctx); err != nil {
 		return fmt.Errorf("closing pull request: %w", err)
 	}
@@ -529,10 +545,11 @@ func (op *op) ClosePullRequest(ctx context.Context) error {
 	return nil
 }
 
-func (op *op) AddLabels(ctx context.Context, labels []string) error {
+func (op *Op) AddLabels(ctx context.Context, labels []string) error {
 	hasAllLabels := true
 	for _, label := range labels {
 		if !hasLabel(op.PullRequest, label) {
+			klog.Infof("object %+v is missing label %v", op.PullRequest, label)
 			hasAllLabels = false
 		}
 	}
@@ -550,6 +567,7 @@ func (op *op) AddLabels(ctx context.Context, labels []string) error {
 		return fmt.Errorf("getting pull request: %w", err)
 	}
 
+	klog.Infof("adding labels %v", labels)
 	if err := pr.AddLabels(ctx, labels); err != nil {
 		return fmt.Errorf("updating labels: %w", err)
 	}
@@ -557,7 +575,7 @@ func (op *op) AddLabels(ctx context.Context, labels []string) error {
 	return nil
 }
 
-func (op *op) RemoveLabels(ctx context.Context, labels []string) error {
+func (op *Op) RemoveLabels(ctx context.Context, labels []string) error {
 	hasAnyLabel := false
 	for _, label := range labels {
 		if hasLabel(op.PullRequest, label) {
@@ -577,6 +595,7 @@ func (op *op) RemoveLabels(ctx context.Context, labels []string) error {
 		return fmt.Errorf("getting pull request: %w", err)
 	}
 
+	klog.Infof("removing labels %v", labels)
 	if err := pr.RemoveLabels(ctx, labels); err != nil {
 		return fmt.Errorf("updating labels: %w", err)
 	}
@@ -584,7 +603,7 @@ func (op *op) RemoveLabels(ctx context.Context, labels []string) error {
 	return nil
 }
 
-func runMergeRobot(ctx context.Context, op *op, obj *v1alpha1.PullRequest) error {
+func runMergeRobot(ctx context.Context, op *Op, obj *v1alpha1.PullRequest) error {
 	if !isOpen(obj) {
 		return nil
 	}
@@ -608,8 +627,9 @@ func runMergeRobot(ctx context.Context, op *op, obj *v1alpha1.PullRequest) error
 		for _, check := range checkSuites.Checks {
 			testCount++
 			switch check.Conclusion {
-			case "success":
+			case "success", "neutral":
 			default:
+				klog.Infof("test failure: %+v", check)
 				allTestsPassing = false
 			}
 		}
@@ -628,6 +648,7 @@ func runMergeRobot(ctx context.Context, op *op, obj *v1alpha1.PullRequest) error
 	if err != nil {
 		return fmt.Errorf("getting pull request: %w", err)
 	}
+	klog.Infof("merging PR %v", prNumber)
 	if err := pr.Merge(ctx, "merge"); err != nil {
 		return fmt.Errorf("merging pr: %w", err)
 	}

@@ -130,7 +130,7 @@ func (o *PullRequest) Retest(ctx context.Context, checkSuiteID int64) error {
 	}
 
 	if len(workflowRuns.WorkflowRuns) != 1 {
-		klog.Fatalf("unexpected number of workflow runs: %v", len(workflowRuns.WorkflowRuns))
+		klog.Fatalf("unexpected number of workflow runs for checkSuiteID=%v: %v", checkSuiteID, len(workflowRuns.WorkflowRuns))
 	}
 	workflowRun := workflowRuns.WorkflowRuns[0]
 	result, err := o.githubClient.Actions.RerunFailedJobsByID(ctx, o.repo.owner, o.repo.repoName, workflowRun.GetID())

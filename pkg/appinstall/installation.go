@@ -2,6 +2,7 @@ package appinstall
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -25,7 +26,7 @@ type Installation struct {
 	githubClient   *github.Client
 	org            string
 
-	eventHandlers []events.Handler
+	// eventHandlers []events.Handler
 
 	lastUpdateMutex sync.Mutex
 	lastUpdate      map[string]time.Time
@@ -80,9 +81,9 @@ func NewInstallation(ctx context.Context, k8s client.Client, appGithubClient *gi
 	return i, nil
 }
 
-func (i *Installation) AddEventHandler(handler events.Handler) {
-	i.eventHandlers = append(i.eventHandlers, handler)
-}
+// func (i *Installation) AddEventHandler(handler events.Handler) {
+// 	i.eventHandlers = append(i.eventHandlers, handler)
+// }
 
 func (i *Installation) GithubClient() *github.Client {
 	return i.githubClient
@@ -118,19 +119,19 @@ func (i *Installation) PollOrgEventsOnce(ctx context.Context) (time.Duration, er
 
 		switch payload := payload.(type) {
 		case *github.IssueCommentEvent:
-			for _, handler := range i.eventHandlers {
-				if h, ok := handler.(events.IssueCommentHandler); ok {
-					ev := &events.IssueCommentEvent{
-						CommentBody:   payload.GetComment().GetBody(),
-						CommentAuthor: payload.GetComment().GetUser().GetLogin(),
-						PRAuthor:      payload.GetIssue().GetUser().GetLogin(),
-						PRNumber:      payload.GetIssue().GetNumber(),
-					}
-					if err := h.OnIssueCommentEvent(ctx, scope, ev); err != nil {
-						return pollInterval, fmt.Errorf("handling event: %w", err)
-					}
-				}
-			}
+			// for _, handler := range i.eventHandlers {
+			// 	if h, ok := handler.(events.IssueCommentHandler); ok {
+			// 		ev := &events.IssueCommentEvent{
+			// 			CommentBody:   payload.GetComment().GetBody(),
+			// 			CommentAuthor: payload.GetComment().GetUser().GetLogin(),
+			// 			PRAuthor:      payload.GetIssue().GetUser().GetLogin(),
+			// 			PRNumber:      payload.GetIssue().GetNumber(),
+			// 		}
+			// 		if err := h.OnIssueCommentEvent(ctx, scope, ev); err != nil {
+			// 			return pollInterval, fmt.Errorf("handling event: %w", err)
+			// 		}
+			// 	}
+			// }
 
 		default:
 			klog.V(2).Infof("ignoring payload type %T", payload)
@@ -182,19 +183,19 @@ func (i *Installation) PollRepoEventsOnce(ctx context.Context, owner string, rep
 
 		switch payload := payload.(type) {
 		case *github.IssueCommentEvent:
-			for _, handler := range i.eventHandlers {
-				if h, ok := handler.(events.IssueCommentHandler); ok {
-					ev := &events.IssueCommentEvent{
-						CommentBody:   payload.GetComment().GetBody(),
-						CommentAuthor: payload.GetComment().GetUser().GetLogin(),
-						PRAuthor:      payload.GetIssue().GetUser().GetLogin(),
-						PRNumber:      payload.GetIssue().GetNumber(),
-					}
-					if err := h.OnIssueCommentEvent(ctx, scope, ev); err != nil {
-						return pollInterval, fmt.Errorf("handling event: %w", err)
-					}
-				}
-			}
+			// for _, handler := range i.eventHandlers {
+			// 	if h, ok := handler.(events.IssueCommentHandler); ok {
+			// 		ev := &events.IssueCommentEvent{
+			// 			CommentBody:   payload.GetComment().GetBody(),
+			// 			CommentAuthor: payload.GetComment().GetUser().GetLogin(),
+			// 			PRAuthor:      payload.GetIssue().GetUser().GetLogin(),
+			// 			PRNumber:      payload.GetIssue().GetNumber(),
+			// 		}
+			// 		if err := h.OnIssueCommentEvent(ctx, scope, ev); err != nil {
+			// 			return pollInterval, fmt.Errorf("handling event: %w", err)
+			// 		}
+			// 	}
+			// }
 
 		default:
 			klog.V(2).Infof("ignoring payload type %T", payload)
@@ -230,6 +231,11 @@ func (i *Installation) PollForUpdates(ctx context.Context, owner string, repo st
 		return fmt.Errorf("listing events for repo %s/%s: %w", owner, repo, err)
 	}
 
+	s := &ObjectSyncer{
+		GithubClient: i.githubClient,
+		KubeClient:   i.k8s,
+	}
+
 	for _, issue := range issues {
 		if i.seenUpdated(ctx, issue.GetNodeID(), issue.GetUpdatedAt().Time) {
 			continue
@@ -237,162 +243,185 @@ func (i *Installation) PollForUpdates(ctx context.Context, owner string, repo st
 		if !issue.IsPullRequest() {
 			continue
 		}
-		pullRequest, _, err := i.githubClient.PullRequests.Get(ctx, owner, repo, issue.GetNumber())
-		if err != nil {
+		if err := s.SyncObjectFromGithub(ctx, owner, repo, issue.GetNumber()); err != nil {
 			klog.Infof("issue is %+v", issue)
-			return fmt.Errorf("getting pr %s/%s %v: %w", owner, repo, issue.GetNumber(), err)
-		}
-
-		labels, _, err := i.githubClient.Issues.ListLabelsByIssue(ctx, owner, repo, issue.GetNumber(), &github.ListOptions{})
-		if err != nil {
-			return fmt.Errorf("getting issue labels %s/%s %v: %w", owner, repo, issue.GetNumber(), err)
-		}
-
-		klog.Infof("PR %v", pullRequest.GetTitle())
-		scope := &events.Scope{
-			Github: i.githubClient,
-			Owner:  owner,
-			Repo:   repo,
-		}
-
-		listCommentsOpts := &github.IssueListCommentsOptions{
-			Sort:      PtrTo("updated"),
-			Direction: PtrTo("desc"),
-			// TODO: Since?
-		}
-		listCommentsOpts.PerPage = 100
-		comments, _, err := i.githubClient.Issues.ListComments(ctx, owner, repo, pullRequest.GetNumber(), listCommentsOpts)
-		if err != nil {
-			return fmt.Errorf("listing comments for pr %s/%s %v: %w", owner, repo, pullRequest.GetNumber(), err)
-		}
-
-		ev := &events.PullRequest{
-			Number:  pullRequest.GetNumber(),
-			Title:   pullRequest.GetTitle(),
-			Author:  pullRequest.GetUser().GetLogin(),
-			BaseRef: pullRequest.GetBase().GetRef(),
-			Merged:  pullRequest.GetMerged(),
-		}
-
-		for _, label := range labels {
-			ev.Labels = append(ev.Labels, label.GetName())
-		}
-
-		for _, comment := range comments {
-			ev.Comments = append(ev.Comments, events.Comment{
-				Body:   comment.GetBody(),
-				Author: comment.GetUser().GetLogin(),
-			})
-		}
-
-		for _, handler := range i.eventHandlers {
-			if h, ok := handler.(events.PullRequestHandler); ok {
-				if err := h.OnPullRequestUpdated(ctx, scope, ev); err != nil {
-					return fmt.Errorf("handling event: %w", err)
-				}
-			} else {
-				klog.Warningf("unhandled handler type %T", handler)
-			}
-		}
-
-		id := types.NamespacedName{Namespace: repo, Name: fmt.Sprintf("github-%d", pullRequest.GetNumber())}
-		u := &unstructured.Unstructured{}
-		u.SetName(id.Name)
-		u.SetNamespace(id.Namespace)
-		u.SetGroupVersionKind(v1alpha1.PullRequestGVK)
-		spec := map[string]any{}
-		spec["title"] = pullRequest.GetTitle()
-		spec["url"] = pullRequest.GetHTMLURL()
-		spec["state"] = pullRequest.GetState()
-		spec["author"] = pullRequest.GetUser().GetLogin()
-		spec["body"] = pullRequest.GetBody()
-		spec["createdAt"] = asTime(pullRequest.GetCreatedAt())
-		spec["updatedAt"] = asTime(pullRequest.GetUpdatedAt())
-
-		specLabels := []v1alpha1.Label{} // empty array to keep CRDs happy
-		for _, label := range labels {
-			out := v1alpha1.Label{
-				Name: label.GetName(),
-				// CreatedAt: asTime(label.GetCreatedAt()),
-			}
-			specLabels = append(specLabels, out)
-		}
-		spec["labels"] = specLabels
-
-		specBase := v1alpha1.BaseRef{}
-		specBase.Ref = pullRequest.GetBase().GetRef()
-		specBase.SHA = pullRequest.GetBase().GetSHA()
-		for _, label := range labels {
-			out := v1alpha1.Label{
-				Name: label.GetName(),
-				// CreatedAt: asTime(label.GetCreatedAt()),
-			}
-			specLabels = append(specLabels, out)
-		}
-		spec["base"] = specBase
-
-		specComments := []v1alpha1.Comment{} // empty array to keep CRDs happy
-		for _, comment := range comments {
-			out := v1alpha1.Comment{
-				Body:      comment.GetBody(),
-				Author:    comment.GetUser().GetLogin(),
-				CreatedAt: asTime(comment.GetCreatedAt()),
-			}
-			specComments = append(specComments, out)
-		}
-		spec["comments"] = specComments
-
-		ref := pullRequest.GetHead().GetSHA()
-		// if pullRequest.GetNumber() == 4106 {
-		// 	checkSuiteList, _, err := i.githubClient.Checks.ListCheckSuitesForRef(ctx, owner, repo, ref, &github.ListCheckSuiteOptions{})
-		// 	if err != nil {
-		// 		return fmt.Errorf("listing comments for pr %s/%s %v: %w", owner, repo, pullRequest.GetNumber(), err)
-		// 	}
-		// 	klog.Infof("list check suites %q: %+v", ref, checkSuiteList.CheckSuites)
-		// 	klog.Fatalf("foo")
-		// }
-
-		checks, _, err := i.githubClient.Checks.ListCheckRunsForRef(ctx, owner, repo, ref, &github.ListCheckRunsOptions{})
-		if err != nil {
-			return fmt.Errorf("getting checks %s/%s %v: %w", owner, repo, issue.GetNumber(), err)
-		}
-		// klog.Infof("list checks: %+v", checks.CheckRuns)
-
-		checkSuites := []*v1alpha1.CheckSuite{} // empty array to keep CRDs happy
-		checkSuiteMap := make(map[int64]*v1alpha1.CheckSuite)
-
-		for _, checkRun := range checks.CheckRuns {
-			checkSuiteID := checkRun.GetCheckSuite().GetID()
-			checkSuite := checkSuiteMap[checkSuiteID]
-			if checkSuite == nil {
-				checkSuite = &v1alpha1.CheckSuite{
-					ID: checkSuiteID,
-				}
-				checkSuiteMap[checkSuiteID] = checkSuite
-				checkSuites = append(checkSuites, checkSuite)
-			}
-			out := v1alpha1.Check{
-				Name:        checkRun.GetName(),
-				Status:      checkRun.GetStatus(),
-				Conclusion:  checkRun.GetConclusion(),
-				CompletedAt: asOptionalTime(checkRun.CompletedAt),
-				ID:          checkRun.GetID(),
-			}
-			checkSuite.Checks = append(checkSuite.Checks, out)
-		}
-		spec["checkSuites"] = checkSuites
-
-		u.Object["spec"] = spec
-
-		if err := i.k8s.Patch(ctx, u, client.Apply, &client.PatchOptions{
-			FieldManager: "github-syncer",
-		}); err != nil {
-			return fmt.Errorf("updating PullRequest: %w", err)
+			return err
 		}
 		i.recordSeen(ctx, issue.GetNodeID(), issue.GetUpdatedAt().Time)
 	}
 
 	return nil
+}
+
+type ObjectSyncer struct {
+	GithubClient *github.Client
+	KubeClient   client.Client
+}
+
+func (s *ObjectSyncer) SyncObjectFromGithub(ctx context.Context, owner string, repo string, issueNumber int) error {
+
+	pullRequest, _, err := s.GithubClient.PullRequests.Get(ctx, owner, repo, issueNumber)
+	if err != nil {
+		return fmt.Errorf("getting pr %s/%s %v: %w", owner, repo, issueNumber, err)
+	}
+
+	labels, _, err := s.GithubClient.Issues.ListLabelsByIssue(ctx, owner, repo, issueNumber, &github.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("getting issue labels %s/%s %v: %w", owner, repo, issueNumber, err)
+	}
+
+	klog.Infof("PR %v", pullRequest.GetTitle())
+	// scope := &events.Scope{
+	// 	Github: i.githubClient,
+	// 	Owner:  owner,
+	// 	Repo:   repo,
+	// }
+
+	listCommentsOpts := &github.IssueListCommentsOptions{
+		Sort:      PtrTo("updated"),
+		Direction: PtrTo("desc"),
+		// TODO: Since?
+	}
+	listCommentsOpts.PerPage = 100
+	comments, _, err := s.GithubClient.Issues.ListComments(ctx, owner, repo, pullRequest.GetNumber(), listCommentsOpts)
+	if err != nil {
+		return fmt.Errorf("listing comments for pr %s/%s %v: %w", owner, repo, pullRequest.GetNumber(), err)
+	}
+
+	// ev := &events.PullRequest{
+	// 	Number:  pullRequest.GetNumber(),
+	// 	Title:   pullRequest.GetTitle(),
+	// 	Author:  pullRequest.GetUser().GetLogin(),
+	// 	BaseRef: pullRequest.GetBase().GetRef(),
+	// 	Merged:  pullRequest.GetMerged(),
+	// }
+
+	// for _, label := range labels {
+	// 	ev.Labels = append(ev.Labels, label.GetName())
+	// }
+
+	// for _, comment := range comments {
+	// 	ev.Comments = append(ev.Comments, events.Comment{
+	// 		Body:   comment.GetBody(),
+	// 		Author: comment.GetUser().GetLogin(),
+	// 	})
+	// }
+
+	// for _, handler := range i.eventHandlers {
+	// 	if h, ok := handler.(events.PullRequestHandler); ok {
+	// 		if err := h.OnPullRequestUpdated(ctx, scope, ev); err != nil {
+	// 			return fmt.Errorf("handling event: %w", err)
+	// 		}
+	// 	} else {
+	// 		klog.Warningf("unhandled handler type %T", handler)
+	// 	}
+	// }
+
+	id := types.NamespacedName{Namespace: repo, Name: fmt.Sprintf("github-%d", pullRequest.GetNumber())}
+	u := &unstructured.Unstructured{}
+	u.SetName(id.Name)
+	u.SetNamespace(id.Namespace)
+	u.SetGroupVersionKind(v1alpha1.PullRequestGVK)
+	spec := map[string]any{}
+	spec["title"] = pullRequest.GetTitle()
+	spec["url"] = pullRequest.GetHTMLURL()
+	spec["state"] = pullRequest.GetState()
+	spec["author"] = pullRequest.GetUser().GetLogin()
+	spec["body"] = pullRequest.GetBody()
+	spec["createdAt"] = asTime(pullRequest.GetCreatedAt())
+	spec["updatedAt"] = asTime(pullRequest.GetUpdatedAt())
+
+	specLabels := []v1alpha1.Label{} // empty array to keep CRDs happy
+	for _, label := range labels {
+		out := v1alpha1.Label{
+			Name: label.GetName(),
+			// CreatedAt: asTime(label.GetCreatedAt()),
+		}
+		specLabels = append(specLabels, out)
+	}
+	spec["labels"] = specLabels
+
+	specBase := v1alpha1.BaseRef{}
+	specBase.Ref = pullRequest.GetBase().GetRef()
+	specBase.SHA = pullRequest.GetBase().GetSHA()
+	// for _, label := range labels {
+	// 	out := v1alpha1.Label{
+	// 		Name: label.GetName(),
+	// 		// CreatedAt: asTime(label.GetCreatedAt()),
+	// 	}
+	// 	specLabels = append(specLabels, out)
+	// }
+	spec["base"] = specBase
+
+	specComments := []v1alpha1.Comment{} // empty array to keep CRDs happy
+	for _, comment := range comments {
+		out := v1alpha1.Comment{
+			Body:      comment.GetBody(),
+			Author:    comment.GetUser().GetLogin(),
+			CreatedAt: asTime(comment.GetCreatedAt()),
+		}
+		specComments = append(specComments, out)
+	}
+	spec["comments"] = specComments
+
+	ref := pullRequest.GetHead().GetSHA()
+	// if pullRequest.GetNumber() == 4106 {
+	// 	checkSuiteList, _, err := i.githubClient.Checks.ListCheckSuitesForRef(ctx, owner, repo, ref, &github.ListCheckSuiteOptions{})
+	// 	if err != nil {
+	// 		return fmt.Errorf("listing comments for pr %s/%s %v: %w", owner, repo, pullRequest.GetNumber(), err)
+	// 	}
+	// 	klog.Infof("list check suites %q: %+v", ref, checkSuiteList.CheckSuites)
+	// 	klog.Fatalf("foo")
+	// }
+
+	checks, _, err := s.GithubClient.Checks.ListCheckRunsForRef(ctx, owner, repo, ref, &github.ListCheckRunsOptions{})
+	if err != nil {
+		return fmt.Errorf("getting checks %s/%s %v: %w", owner, repo, issueNumber, err)
+	}
+	// klog.Infof("list checks: %+v", checks.CheckRuns)
+
+	checkSuites := []*v1alpha1.CheckSuite{} // empty array to keep CRDs happy
+	checkSuiteMap := make(map[int64]*v1alpha1.CheckSuite)
+
+	for _, checkRun := range checks.CheckRuns {
+		checkSuiteID := checkRun.GetCheckSuite().GetID()
+		checkSuite := checkSuiteMap[checkSuiteID]
+		if checkSuite == nil {
+			checkSuite = &v1alpha1.CheckSuite{
+				ID: checkSuiteID,
+			}
+			checkSuiteMap[checkSuiteID] = checkSuite
+			checkSuites = append(checkSuites, checkSuite)
+		}
+		out := v1alpha1.Check{
+			Name:        checkRun.GetName(),
+			Status:      checkRun.GetStatus(),
+			Conclusion:  checkRun.GetConclusion(),
+			CompletedAt: asOptionalTime(checkRun.CompletedAt),
+			ID:          checkRun.GetID(),
+		}
+		checkSuite.Checks = append(checkSuite.Checks, out)
+	}
+	spec["checkSuites"] = checkSuites
+
+	u.Object["spec"] = spec
+
+	klog.Infof("patching PullRequest %v", AsJSON(u))
+	if err := s.KubeClient.Patch(ctx, u, client.Apply, &client.PatchOptions{
+		FieldManager: "github-syncer",
+	}); err != nil {
+		return fmt.Errorf("updating PullRequest: %w", err)
+	}
+
+	return nil
+}
+
+func AsJSON(obj any) string {
+	b, err := json.Marshal(obj)
+	if err != nil {
+		return fmt.Sprintf("<error:%v>", err)
+	}
+	return string(b)
 }
 
 func PtrTo[T any](t T) *T {

@@ -77,6 +77,7 @@ func (o *Repo) CodeOwners(ctx context.Context, ref string) (*permissions.Owners,
 	}
 	// TODO: HACK!
 	owners.Owners = append(owners.Owners, "justinsb")
+	owners.Owners = append(owners.Owners, "droot")
 
 	o.ownersByRef[ref] = owners
 
