@@ -26,6 +26,7 @@ type PullRequestSpec struct {
 	Comments    []Comment    `json:"comments,omitempty"`
 	CheckSuites []CheckSuite `json:"checkSuites,omitempty"`
 	Labels      []Label      `json:"labels,omitempty"`
+	Assigned    []Assigned   `json:"assigned,omitempty"`
 }
 
 type BaseRef struct {
@@ -47,6 +48,11 @@ type Comment struct {
 type Label struct {
 	Name      string       `json:"name,omitempty"`
 	CreatedAt *metav1.Time `json:"createdAt,omitempty"`
+}
+
+type Assigned struct {
+	Name string `json:"name,omitempty"`
+	// CreatedAt *metav1.Time `json:"createdAt,omitempty"`
 }
 
 type Check struct {

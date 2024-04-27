@@ -341,6 +341,17 @@ func (s *ObjectSyncer) SyncObjectFromGithub(ctx context.Context, owner string, r
 	}
 	spec["labels"] = specLabels
 
+	specAssigned := []v1alpha1.Assigned{} // empty array to keep CRDs happy
+	for _, assignee := range pullRequest.Assignees {
+		klog.Infof("assignee is %+v", assignee)
+		out := v1alpha1.Assigned{
+			Name: assignee.GetLogin(),
+			// CreatedAt: asTime(label.GetCreatedAt()),
+		}
+		specAssigned = append(specAssigned, out)
+	}
+	spec["assigned"] = specAssigned
+
 	specBase := v1alpha1.BaseRef{}
 	specBase.Ref = pullRequest.GetBase().GetRef()
 	specBase.SHA = pullRequest.GetBase().GetSHA()

@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -18,6 +19,7 @@ import (
 	"golang.org/x/oauth2"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
@@ -142,7 +144,7 @@ func run(ctx context.Context) error {
 				}
 
 				// klog.Infof("running reconcile for %v", obj.GetName())
-				if err := runAllReconcilers(ctx, k8s, op, obj); err != nil {
+				if err := runAllReconcilers(ctx, k8s, op); err != nil {
 					klog.Warningf("error reconciling %v: %v", obj.GetName(), err)
 				}
 			}
@@ -154,10 +156,10 @@ func run(ctx context.Context) error {
 	return nil
 }
 
-func runAllReconcilers(ctx context.Context, k8s client.Client, op *Op, obj *v1alpha1.PullRequest) error {
-	id := types.NamespacedName{Namespace: obj.GetNamespace(), Name: obj.GetName()}
+func runAllReconcilers(ctx context.Context, k8s client.Client, op *Op) error {
+	id := types.NamespacedName{Namespace: op.PullRequest.GetNamespace(), Name: op.PullRequest.GetName()}
 
-	var reconcilers []func(ctx context.Context, op *Op, obj *v1alpha1.PullRequest) error
+	var reconcilers []func(ctx context.Context, op *Op) error
 
 	reconcilers = append(reconcilers, runRetestRobot)
 	reconcilers = append(reconcilers, runHoldRobot)
@@ -165,12 +167,13 @@ func runAllReconcilers(ctx context.Context, k8s client.Client, op *Op, obj *v1al
 	reconcilers = append(reconcilers, runApprovedRobot)
 	reconcilers = append(reconcilers, runCloseRobot)
 	reconcilers = append(reconcilers, runMergeRobot)
+	reconcilers = append(reconcilers, runAssignRobot)
 
 	for {
 		op.Changed = false
 
 		for _, reconciler := range reconcilers {
-			if err := reconciler(ctx, op, obj); err != nil {
+			if err := reconciler(ctx, op); err != nil {
 				return err
 			}
 			if op.Changed {
@@ -197,13 +200,15 @@ func runAllReconcilers(ctx context.Context, k8s client.Client, op *Op, obj *v1al
 		}
 		j, _ := json.Marshal(updated)
 		klog.Infof("updated object is %v", string(j))
-		obj = updated
+		op.PullRequest = updated
 	}
 
 	return nil
 }
 
-func runCloseRobot(ctx context.Context, op *Op, pullRequest *v1alpha1.PullRequest) error {
+func runCloseRobot(ctx context.Context, op *Op) error {
+	pullRequest := op.PullRequest
+
 	if !isOpen(pullRequest) {
 		return nil
 	}
@@ -234,7 +239,8 @@ func PtrTo[T any](t T) *T {
 	return &t
 }
 
-func runRetestRobot(ctx context.Context, op *Op, pullRequest *v1alpha1.PullRequest) error {
+func runRetestRobot(ctx context.Context, op *Op) error {
+	pullRequest := op.PullRequest
 	if !isOpen(pullRequest) {
 		return nil
 	}
@@ -277,8 +283,10 @@ type Op struct {
 	Changed     bool
 }
 
-func runHoldRobot(ctx context.Context, op *Op, obj *v1alpha1.PullRequest) error {
-	if !isOpen(obj) {
+func runHoldRobot(ctx context.Context, op *Op) error {
+	pullRequest := op.PullRequest
+
+	if !isOpen(pullRequest) {
 		// It may be OK to apply labels to old PRs... IDK
 		return nil
 	}
@@ -288,7 +296,7 @@ func runHoldRobot(ctx context.Context, op *Op, obj *v1alpha1.PullRequest) error 
 		CancelCommands: []string{"/hold cancel", "/unhold", "/remove-hold"},
 	}
 
-	applyAt, cancelAt, err := r.ParseForCommands(ctx, op.Repo, obj)
+	applyAt, cancelAt, err := r.ParseForCommands(ctx, op.Repo, pullRequest)
 	if err != nil {
 		return err
 	}
@@ -337,9 +345,11 @@ func isApprover(ctx context.Context, repo *forge.Repo, baseRef string, userName 
 // 	return false, nil
 // }
 
-func runLGTMRobot(ctx context.Context, op *Op, obj *v1alpha1.PullRequest) error {
+func runLGTMRobot(ctx context.Context, op *Op) error {
 
-	if !isOpen(obj) {
+	pullRequest := op.PullRequest
+
+	if !isOpen(pullRequest) {
 		return nil
 	}
 
@@ -350,7 +360,7 @@ func runLGTMRobot(ctx context.Context, op *Op, obj *v1alpha1.PullRequest) error 
 	r.AddPermissionCheck(op.requireCodeOwnerPermission("lgtm"))
 	r.AddPermissionCheck(op.noSelfApproval("lgtm"))
 
-	applyAt, cancelAt, err := r.ParseForCommands(ctx, op.Repo, obj)
+	applyAt, cancelAt, err := r.ParseForCommands(ctx, op.Repo, pullRequest)
 	if err != nil {
 		return err
 	}
@@ -436,6 +446,40 @@ func (r *ThreadReader) ParseForCommands(ctx context.Context, repo *forge.Repo, o
 	return applyAt, cancelAt, nil
 }
 
+type ThreadScanner struct {
+	matchers []*matcher
+}
+
+type matcher struct {
+	regex    *regexp.Regexp
+	callback func(comment *v1alpha1.Comment, line string, matches []string)
+}
+
+func (r *ThreadScanner) AddMatcher(regex string, callback func(comment *v1alpha1.Comment, line string, matches []string)) {
+	matcher := &matcher{
+		regex:    regexp.MustCompile(regex),
+		callback: callback,
+	}
+	r.matchers = append(r.matchers, matcher)
+}
+
+func (r *ThreadScanner) MatchCommands(ctx context.Context, repo *forge.Repo, obj *v1alpha1.PullRequest) error {
+	for i := range obj.Spec.Comments {
+		comment := &obj.Spec.Comments[i]
+
+		for _, line := range strings.Split(comment.Body, "\n") {
+			line = strings.TrimSpace(line)
+			for _, matcher := range r.matchers {
+				if matches := matcher.regex.FindStringSubmatch(line); matches != nil {
+					matcher.callback(comment, line, matches)
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
 func (op *Op) requireCodeOwnerPermission(verb string) PermissionCheckFunction {
 	return func(ctx context.Context, comment *v1alpha1.Comment) (bool, error) {
 		if op.PullRequest.Spec.Base == nil {
@@ -469,9 +513,10 @@ func (op *Op) noSelfApproval(verb string) PermissionCheckFunction {
 	}
 }
 
-func runApprovedRobot(ctx context.Context, op *Op, obj *v1alpha1.PullRequest) error {
+func runApprovedRobot(ctx context.Context, op *Op) error {
+	pullRequest := op.PullRequest
 
-	if !isOpen(obj) {
+	if !isOpen(pullRequest) {
 		return nil
 	}
 
@@ -482,7 +527,7 @@ func runApprovedRobot(ctx context.Context, op *Op, obj *v1alpha1.PullRequest) er
 	r.AddPermissionCheck(op.requireCodeOwnerPermission("approve"))
 	r.AddPermissionCheck(op.noSelfApproval("approve"))
 
-	applyAt, cancelAt, err := r.ParseForCommands(ctx, op.Repo, obj)
+	applyAt, cancelAt, err := r.ParseForCommands(ctx, op.Repo, pullRequest)
 	if err != nil {
 		return err
 	}
@@ -603,19 +648,21 @@ func (op *Op) RemoveLabels(ctx context.Context, labels []string) error {
 	return nil
 }
 
-func runMergeRobot(ctx context.Context, op *Op, obj *v1alpha1.PullRequest) error {
-	if !isOpen(obj) {
+func runMergeRobot(ctx context.Context, op *Op) error {
+	pullRequest := op.PullRequest
+
+	if !isOpen(pullRequest) {
 		return nil
 	}
 
-	prNumber, err := strconv.Atoi(strings.TrimPrefix(obj.Name, "github-"))
+	prNumber, err := strconv.Atoi(strings.TrimPrefix(pullRequest.Name, "github-"))
 	if err != nil {
-		return fmt.Errorf("parsing name %q", obj.Name)
+		return fmt.Errorf("parsing name %q", pullRequest.Name)
 	}
 
-	hasLGTM := hasLabel(obj, LabelLGTM)
-	hasApproved := hasLabel(obj, LabelApproved)
-	hasHold := hasLabel(obj, LabelHold)
+	hasLGTM := hasLabel(pullRequest, LabelLGTM)
+	hasApproved := hasLabel(pullRequest, LabelApproved)
+	hasHold := hasLabel(pullRequest, LabelHold)
 
 	if hasHold || !hasLGTM || !hasApproved {
 		return nil
@@ -623,7 +670,7 @@ func runMergeRobot(ctx context.Context, op *Op, obj *v1alpha1.PullRequest) error
 
 	allTestsPassing := true
 	testCount := 0
-	for _, checkSuites := range obj.Spec.CheckSuites {
+	for _, checkSuites := range pullRequest.Spec.CheckSuites {
 		for _, check := range checkSuites.Checks {
 			testCount++
 			switch check.Conclusion {
@@ -666,6 +713,76 @@ func hasLabel(pr *v1alpha1.PullRequest, findLabel string) bool {
 	return false
 }
 
+func hasAssignee(pr *v1alpha1.PullRequest, findAssignee string) bool {
+	for _, assignee := range pr.Spec.Assigned {
+		if assignee.Name == findAssignee {
+			return true
+		}
+	}
+	return false
+}
+
 func isOpen(pr *v1alpha1.PullRequest) bool {
 	return pr.Spec.State == "open"
+}
+
+func runAssignRobot(ctx context.Context, op *Op) error {
+	pullRequest := op.PullRequest
+
+	if !isOpen(pullRequest) {
+		return nil
+	}
+
+	assignees := sets.New[string]()
+	assign := func(comment *v1alpha1.Comment, assignee string) {
+		assignees.Insert(strings.TrimPrefix(assignee, "@"))
+	}
+	threadScanner := &ThreadScanner{}
+	threadScanner.AddMatcher("/assign (@[[:alpha:]]+)", func(comment *v1alpha1.Comment, line string, matches []string) {
+		assign(comment, matches[1])
+	})
+
+	err := threadScanner.MatchCommands(ctx, op.Repo, pullRequest)
+	if err != nil {
+		return err
+	}
+
+	if assignees.Len() != 0 {
+		if err := op.AddAssignees(ctx, assignees.UnsortedList()); err != nil {
+			return fmt.Errorf("adding assignees: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func (op *Op) AddAssignees(ctx context.Context, assignees []string) error {
+	hasAllAssignees := true
+	for _, assignee := range assignees {
+		if !hasAssignee(op.PullRequest, assignee) {
+			klog.Infof("object %+v is missing assignee %v", op.PullRequest, assignee)
+			hasAllAssignees = false
+		}
+	}
+	if hasAllAssignees {
+		return nil
+	}
+
+	prNumber, err := strconv.Atoi(strings.TrimPrefix(op.PullRequest.Name, "github-"))
+	if err != nil {
+		return fmt.Errorf("parsing name %q", op.PullRequest.Name)
+	}
+
+	pr, err := op.Repo.PullRequest(ctx, prNumber)
+	if err != nil {
+		return fmt.Errorf("getting pull request: %w", err)
+	}
+
+	klog.Infof("adding assignees %v", assignees)
+	if err := pr.AddAssignees(ctx, assignees); err != nil {
+		return fmt.Errorf("updating assignees: %w", err)
+	}
+	op.Changed = true
+
+	return nil
 }

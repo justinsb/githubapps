@@ -5,7 +5,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/scheme"
 )
 
-//go:generate go run sigs.k8s.io/controller-tools/cmd/controller-gen@v0.8.0 object crd:crdVersions=v1 output:crd:artifacts:config=config/ paths=./...
+//go:generate go run sigs.k8s.io/controller-tools/cmd/controller-gen@v0.14.0 object crd:crdVersions=v1 output:crd:artifacts:config=config/ paths=./...
 
 //+kubebuilder:object:generate=true
 //+groupName=automation.kpt.dev

@@ -143,3 +143,35 @@ func (o *PullRequest) Retest(ctx context.Context, checkSuiteID int64) error {
 
 	return nil
 }
+
+func (o *PullRequest) AddAssignees(ctx context.Context, wantAssignees []string) error {
+	if o.obj.GetMerged() {
+		// TODO: post to issue
+		klog.Warningf("cannot update merged pull request %v", o.prNumber)
+		return nil
+	}
+
+	var assigneesToAdd []string
+	for _, wantAssignee := range wantAssignees {
+		found := false
+		for _, assignee := range o.obj.Assignees {
+			if assignee.GetName() == wantAssignee {
+				found = true
+			}
+		}
+		if !found {
+			assigneesToAdd = append(assigneesToAdd, wantAssignee)
+		}
+	}
+	if len(assigneesToAdd) == 0 {
+		return nil
+	}
+
+	klog.Infof("adding assignees: %+v", assigneesToAdd)
+
+	if _, _, err := o.githubClient.Issues.AddAssignees(ctx, o.repo.owner, o.repo.repoName, o.prNumber, assigneesToAdd); err != nil {
+		return fmt.Errorf("adding assignees %v: %w", assigneesToAdd, err)
+	}
+
+	return nil
+}
