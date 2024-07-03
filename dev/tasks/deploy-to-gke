@@ -12,7 +12,7 @@ if [[ -z "${GCP_PROJECT_ID:-}" ]]; then
 fi
 echo "Using GCP_PROJECT_ID=$GCP_PROJECT_ID"
 
-#IMAGE_PREFIX=gcr.io/${GCP_PROJECT_ID}/
+# export IMAGE_PREFIX=gcr.io/${GCP_PROJECT_ID}/
 # TODO: This is not as standardized as gcr.io
 export IMAGE_PREFIX=us-central1-docker.pkg.dev/${GCP_PROJECT_ID}/registry-us-central1/
 dev/tasks/build-images --push
@@ -25,6 +25,9 @@ kind: Kustomization
 
 resources:
 - ../../manifest.yaml
+- ../../../siteconfig/secrets/codebot-githubapp-backend.yaml
+- ../../../siteconfig/configmaps/codebot-githubapp-backend.yaml
+
 
 images:
 - name: codebot-githubapp-backend
@@ -34,5 +37,9 @@ EOF
 kubectl create ns codebot --dry-run -oyaml | kubectl apply --server-side -f -
 
 export KUBECTL_APPLYSET=true
+
+# TODO: Annoying that we have to bind to a namespace
+kubectl apply --server-side --prune -n codebot --applyset=codebot-crds -f api/v1alpha1/config/
+
 kustomize build --load_restrictor=LoadRestrictionsNone k8s/projects/${GCP_PROJECT_ID}/ | \
   kubectl apply -n codebot --server-side --prune --applyset=codebot-backend -f -

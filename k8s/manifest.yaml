@@ -13,9 +13,12 @@ spec:
       labels:
         app: codebot-githubapp-backend
     spec:
+      serviceAccountName: codebot-githubapp-backend
       containers:
       - name: codebot-githubapp-backend
         image: codebot-githubapp-backend:latest
+        args:
+        -  --app-secret=/secrets/github-app-private-key.pem
         resources:
           requests:
             cpu: "100m"
@@ -23,3 +26,48 @@ spec:
           limits:
             cpu: "500m"
             memory: "500Mi"
+        envFrom:
+        - configMapRef:
+            name: codebot-githubapp-backend
+        volumeMounts:
+        - name: codebot-githubapp-backend
+          readOnly: true
+          mountPath: "/secrets"
+      volumes:
+      - name: codebot-githubapp-backend
+        secret:
+          secretName: codebot-githubapp-backend
+
+---
+
+kind: ServiceAccount
+apiVersion: v1
+metadata:
+  name: codebot-githubapp-backend
+  namespace: codebot
+
+---
+
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: codebot-githubapp-backend
+rules:
+- apiGroups: ["automation.kpt.dev"]
+  resources: ["pullrequests"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete", "deletecollection"]
+
+---
+
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: codebot-githubapp-backend
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: codebot-githubapp-backend
+subjects:
+- kind: ServiceAccount
+  name: codebot-githubapp-backend
+  namespace: codebot
