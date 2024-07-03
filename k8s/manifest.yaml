@@ -1,0 +1,25 @@
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: codebot-githubapp-backend
+  namespace: codebot
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: codebot-githubapp-backend
+  template:
+    metadata:
+      labels:
+        app: codebot-githubapp-backend
+    spec:
+      containers:
+      - name: codebot-githubapp-backend
+        image: codebot-githubapp-backend:latest
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "100Mi"
+          limits:
+            cpu: "500m"
+            memory: "500Mi"
